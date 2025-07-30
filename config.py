@@ -1,18 +1,32 @@
 """
-Configuration settings for models, training, and data processing.
+Configuration settings for segmentation and neural cellular automata experiments.
+
+This module centralises all hyperparameters and directory paths in one place
+so that experiments can be easily adjusted without touching the rest of the
+codebase.  Settings are organised into sections: device, model configs,
+cellular automaton (CA) configs, training defaults, and data loading settings.
 """
 
 import torch
+from typing import Tuple
 
-# Device configuration
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------------------------------------------------------------------------
+# Device selection
+# ---------------------------------------------------------------------------
 
+DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Model configurations
-UNET_CONFIG = {"n_channels": 3, "n_classes": 1}
-SEGNET_CONFIG = {"n_channels": 3, "n_classes": 1}
-DEEPLABV3_CONFIG = {"n_channels": 3, "num_classes": 1, "pretrained": False}
-DEEPLABV3_CONFIG_CONV1 = {
+# ---------------------------------------------------------------------------
+# Model configuration templates
+# ---------------------------------------------------------------------------
+
+# U‑Net variants
+UNET_CONFIG: dict = {"n_channels": 3, "n_classes": 1}
+SEGNET_CONFIG: dict = {"n_channels": 3, "n_classes": 1}
+
+# DeepLabV3 requires additional fields to override the initial conv layer
+DEEPLABV3_CONFIG: dict = {"n_channels": 3, "num_classes": 1, "pretrained": False}
+DEEPLABV3_CONFIG_CONV1: dict = {
     "in_channels": 3,
     "out_channels": 64,
     "kernel_size": 7,
@@ -20,8 +34,16 @@ DEEPLABV3_CONFIG_CONV1 = {
     "padding": 3,
     "bias": False,
 }
-PSPNET_CONFIG = {"in_channels": 3, "classes": 1, "encoder_name": "resnet50"}
 
+# PSPNet uses a backbone; specify encoder
+PSPNET_CONFIG: dict = {"in_channels": 3, "classes": 1, "encoder_name": "resnet50"}
+
+# ---------------------------------------------------------------------------
+# Cellular Automata model configs
+# ---------------------------------------------------------------------------
+
+# Each CA configuration is a dictionary of hyperparameters.  Use the one that
+# best suits your experiment; see README for guidance.
 CAMODEL_CONFIG_01_MINIMAL = {
     "n_channels": 4,
     "hidden_channels": 1,
@@ -142,9 +164,12 @@ CAMODEL_CONFIG_10_ULTRA = {
     "steps": 4,
 }
 
+# ---------------------------------------------------------------------------
 # Training configuration
+# ---------------------------------------------------------------------------
+
 TRAINING_CONFIG = {
-    "dataset_name": "dibco",  # Options: trees, dibco, clouds
+    "dataset_name": "dibco",
     "batch_size": 5,
     "learning_rate": 1e-2,
     "epochs": 30,
@@ -155,27 +180,32 @@ TRAINING_CONFIG = {
     "scheduler_gamma": 0.5,
     "train_images_dir": "data/data-DIBCO/datasets/DIPCO2016_dataset_cropsz",
     "train_masks_dir": "data/data-DIBCO/datasets/DIPCO2016_dataset_cropsz",
-    "test_images_dir": "data/data-DIBCO/datasets/DIPCO2016_dataset_cropsz_test",
-    "test_masks_dir": "data/data-DIBCO/datasets/DIPCO2016_dataset_cropsz_test",
+    "test_images_dir":  "data/data-DIBCO/datasets/DIPCO2016_dataset_cropsz_test",
+    "test_masks_dir":   "data/data-DIBCO/datasets/DIPCO2016_dataset_cropsz_test",
     "default_model_path": "nca_0/nca_0_epoch_0.pt",
     "window_title": "NCA Visualizer",
     "default_threshold": 127,
-    "crop_size": 800
+    "crop_size": 800,
 }
 
-# Random seed
-SEED = 42
+# ---------------------------------------------------------------------------
+# Seeds and DataLoader settings
+# ---------------------------------------------------------------------------
+
+SEED: int = 42
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-# DataLoader configuration
 DATALOADER_CONFIG = {
     "shuffle": True,
     "num_workers": 2 if torch.cuda.is_available() else 0,
     "pin_memory": torch.cuda.is_available(),
 }
 
-# Image processing constants
-TILE_SIZE = (200, 200)
-ADDITIONAL_CHANNELS = 1
-ALPHA = True
+# ---------------------------------------------------------------------------
+# Image constants
+# ---------------------------------------------------------------------------
+
+TILE_SIZE: Tuple[int, int] = (200, 200)
+ADDITIONAL_CHANNELS: int = 1
+ALPHA: bool = True

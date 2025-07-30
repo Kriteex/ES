@@ -1,24 +1,14 @@
 """
-Combined training script that merges the functionality of ``train.py`` and
-``train_steps.py`` from the original project.  This script preserves all
-capabilities from both sources: it supports a range of segmentation and
-neural cellular automata (NCA) models, implements both the simple
-training/evaluation loops found in ``train.py`` as well as the richer
-metric tracking and hardware logging introduced in ``train_steps.py``, and
-offers flexible experiment orchestration (multiple runs, varying NCA
-steps, optional dataset splitting for specific datasets, tensorboard
-logging, MACs/parameter estimation, etc.).
+Combined training script (short version enhanced) that merges the functionality of
+the original short "train.py" with the extended capabilities from the longer file.
 
-The core idea behind the merge is to unify common logic (model
-initialisation, forward passes, metric computation, data loading) and
-expose a single ``main`` entrypoint that can be used for simple
-training runs or more elaborate experiments.  Where the two original
-scripts diverged—such as in the handling of additional metrics like
-PSNR/DRD, or the special splitting behaviour for certain datasets—those
-branches are now incorporated into a single training loop so that
-nothing is lost.  The script remains self contained: it depends only
-on ``config.py``, ``model.py`` and ``utils.py`` from the original
-repository, and can be executed as a standalone module.
+Key additions:
+- NCA now supports composite_loss with pixel-accuracy weighting (train/eval),
+  falling back to BCE if composite_loss is not available.
+- Utilities are abstracted via compatibility aliases to support both naming
+  schemes (compute_/create_/log_metrics_to_files vs calculate_/get_/log_loss).
+- Logging of HW/model statistics uses a unified wrapper (log_model_statistics vs log_hw_metrics).
+- best_epoch is tracked and returned from main() and correctly used in __main__.
 """
 
 from __future__ import annotations
@@ -28,7 +18,7 @@ import os
 import random
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -54,14 +44,72 @@ from config import (
     UNET_CONFIG,
 )
 from model import CAModel, SegNet, UNetNormal, UNetTiny
+
+# --- Utilities: bring both naming schemes under common aliases ----------------
+
 from utils import (
-    calculate_pixel_accuracy,
-    composite_loss,
-    get_dataloader,
-    log_loss,
-    log_hw_metrics,
-    plot_batch_x_channels,
+    # legacy (short script A) names
+    compute_pixel_accuracy as _compute_pixel_accuracy,
+    compute_binary_cross_entropy as _compute_binary_cross_entropy,
+    create_dataloader as _create_dataloader,
+    log_metrics_to_files as _log_metrics_to_files,
+    log_model_statistics as _log_model_statistics,
+    save_batch_visualization as _save_batch_visualization,  # may remain unused
 )
+
+# Try to import the newer (long script B) names; fall back if unavailable
+try:
+    from utils import (
+        calculate_pixel_accuracy as _calculate_pixel_accuracy,
+        composite_loss as _composite_loss,
+        get_dataloader as _get_dataloader,
+        log_loss as _log_loss,
+        log_hw_metrics as _log_hw_metrics,
+        plot_batch_x_channels as _plot_batch_x_channels,  # may remain unused
+    )
+    _HAVE_NEW_UTILS = True
+except Exception:
+    _HAVE_NEW_UTILS = False
+
+# Unify surface API for the rest of the script
+compute_pixel_accuracy_fn = _calculate_pixel_accuracy if _HAVE_NEW_UTILS else _compute_pixel_accuracy
+get_dataloader_fn = _get_dataloader if _HAVE_NEW_UTILS else _create_dataloader
+
+def _log_results(epoch: int,
+                 train_dict: Dict[str, float],
+                 test_dict: Dict[str, float],
+                 exp_name: str,
+                 run: int,
+                 *,
+                 model_config: Optional[Dict[str, Any]] = None) -> None:
+    """Compat wrapper to log metrics regardless of utils version."""
+    if _HAVE_NEW_UTILS:
+        _log_loss(
+            epoch,
+            train_dict,
+            test_dict,
+            exp_name,
+            run,
+            model_config=model_config or {},
+            print_results=True,
+        )
+    else:
+        _log_metrics_to_files(
+            epoch,
+            train_dict,
+            test_dict,
+            exp_name,
+            run,
+            model_config=model_config or {},
+            verbose=True,
+        )
+
+def _log_hw(run_id: int, model_name: str, model_stats: Dict[str, Any]) -> None:
+    """Compat wrapper to log HW/model stats for both utils variants."""
+    if _HAVE_NEW_UTILS:
+        _log_hw_metrics(run_id=run_id, model_name=model_name, model_stats=model_stats)
+    else:
+        _log_model_statistics(run_id=run_id, model_name=model_name, stats=model_stats)
 
 # ---------------------------------------------------------------------------
 # Seeding & multiprocessing configuration
@@ -73,17 +121,13 @@ torch.cuda.manual_seed_all(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
 
-# Ensure that the multiprocessing start method is explicitly set.  Without
-# this call, PyTorch may default to 'fork' on Unix which can cause
-# subtle bugs when spawning worker processes.
+# Ensure that the multiprocessing start method is explicitly set.
 mp.set_start_method("spawn", force=True)
 
 # ---------------------------------------------------------------------------
 # Metric definitions and helper functions
 # ---------------------------------------------------------------------------
 
-# Names of the metrics returned from ``_run_epoch``.  The order here
-# matches the order in which the metrics are computed and returned.
 METRIC_TAGS: Tuple[str, ...] = (
     "Loss",
     "Accuracy",
@@ -96,72 +140,42 @@ METRIC_TAGS: Tuple[str, ...] = (
     "DRD",
 )
 
-# Pre-compute a 5×5 weight matrix used for DRD (distance reciprocal
-# distortion) computation.  The centre of the matrix has the largest
-# weight and the contribution decays with Manhattan distance from the
-# centre.  This definition matches the one found in the original
-# ``train_steps.py``.
+# 5×5 DRD weights (Manhattan distance decay)
 _DRD_WEIGHTS = np.array(
     [[1.0 / (abs(i - 2) + abs(j - 2) + 1) for j in range(5)] for i in range(5)]
 )
 
 def estimate_conv2d_macs(conv: torch.nn.Module, input_shape: Tuple[int, int, int]) -> int:
-    """Estimate multiply–accumulate (MAC) operations for a single Conv2D layer.
-
-    Args:
-        conv: The convolutional layer to analyse.
-        input_shape: Shape of the input tensor (C_in, H, W).
-
-    Returns:
-        Estimated number of MACs performed by the convolution.
-    """
+    """Estimate multiply–accumulate (MAC) operations for a single Conv2d layer."""
     if not isinstance(conv, torch.nn.Conv2d):
         return 0
     C_in, H, W = input_shape
     C_out = conv.out_channels
     K_h, K_w = conv.kernel_size
-    # Output spatial dimensions
-    H_out = (H + 2 * conv.padding[0] - K_h) // conv.stride[0] + 1
-    W_out = (W + 2 * conv.padding[1] - K_w) // conv.stride[1] + 1
-    # MACs = number of output elements × kernel area × C_in
+    stride_h, stride_w = conv.stride
+    pad_h, pad_w = conv.padding
+    H_out = (H + 2 * pad_h - K_h) // stride_h + 1
+    W_out = (W + 2 * pad_w - K_w) // stride_w + 1
     return H_out * W_out * C_out * K_h * K_w * C_in
 
 def estimate_model_macs(model: torch.nn.Module, input_shape: Tuple[int, int, int] = (4, 200, 200)) -> int:
-    """Estimate the total MACs for all Conv2D layers in a model.
-
-    Args:
-        model: The neural network whose MACs should be estimated.
-        input_shape: Shape of the input tensor passed to the first layer.
-
-    Returns:
-        Total number of MACs.
-    """
+    """Estimate total MACs across Conv2d layers using a simple shape propagation."""
     total_macs = 0
     current_shape = input_shape
     for layer in model.modules():
         if isinstance(layer, torch.nn.Conv2d):
-            macs = estimate_conv2d_macs(layer, current_shape)
-            total_macs += macs
-            # Update shape for the next layer.  This is a simplified
-            # propagation that assumes stride and padding remain
-            # constant across width/height.
+            total_macs += estimate_conv2d_macs(layer, current_shape)
             H, W = current_shape[1], current_shape[2]
-            H_out = (H + 2 * layer.padding[0] - layer.kernel_size[0]) // layer.stride[0] + 1
-            W_out = (W + 2 * layer.padding[1] - layer.kernel_size[1]) // layer.stride[1] + 1
+            K_h, K_w = layer.kernel_size
+            stride_h, stride_w = layer.stride
+            pad_h, pad_w = layer.padding
+            H_out = (H + 2 * pad_h - K_h) // stride_h + 1
+            W_out = (W + 2 * pad_w - K_w) // stride_w + 1
             current_shape = (layer.out_channels, H_out, W_out)
     return total_macs
 
 def compute_psnr_batch(pred_batch: np.ndarray, tgt_batch: np.ndarray, eps: float = 1e-10) -> float:
-    """Compute average PSNR for a batch of predictions and targets.
-
-    Args:
-        pred_batch: Predicted images with values in [0, 1].  Shape (B, H, W).
-        tgt_batch: Ground truth images with values in [0, 1].  Shape (B, H, W).
-        eps: Small constant to avoid division by zero.
-
-    Returns:
-        The average PSNR over the batch.
-    """
+    """Compute average PSNR across a batch of predictions/targets in [0, 1]."""
     psnr_values: List[float] = []
     for pred, tgt in zip(pred_batch, tgt_batch):
         mse = max(np.mean((pred - tgt) ** 2), eps)
@@ -169,15 +183,7 @@ def compute_psnr_batch(pred_batch: np.ndarray, tgt_batch: np.ndarray, eps: float
     return float(np.mean(psnr_values))
 
 def compute_drd(pred: np.ndarray, gt: np.ndarray) -> float:
-    """Compute the distance reciprocal distortion (DRD) for a single pair.
-
-    Args:
-        pred: Binary prediction mask (H, W).
-        gt: Binary ground truth mask (H, W).
-
-    Returns:
-        The DRD metric value.
-    """
+    """Compute distance reciprocal distortion (DRD) for a single pair."""
     pred = np.squeeze(pred)
     gt = np.squeeze(gt)
     diff = np.abs(pred - gt)
@@ -187,59 +193,30 @@ def compute_drd(pred: np.ndarray, gt: np.ndarray) -> float:
     return 0.0 if num_error_pixels == 0 else total_drd / num_error_pixels
 
 def compute_drd_batch(pred_batch: np.ndarray, tgt_batch: np.ndarray) -> float:
-    """Compute the average DRD across a batch.
-
-    Args:
-        pred_batch: Batch of binary predictions (B, H, W).
-        tgt_batch: Batch of binary ground truth masks (B, H, W).
-
-    Returns:
-        The mean DRD over the batch.
-    """
+    """Average DRD over batch of binary predictions and ground truths."""
     return float(np.mean([compute_drd(p, t) for p, t in zip(pred_batch, tgt_batch)]))
 
 def compute_p_fm(precision: float, recall: float, beta_squared: float = 0.3) -> float:
-    """Compute the pseudo-F measure (p-FM) given precision and recall.
-
-    When precision and recall are both zero, returns zero to avoid
-    division by zero.  Otherwise computes the weighted harmonic mean.
-
-    Args:
-        precision: Precision value.
-        recall: Recall value.
-        beta_squared: Weighting factor (beta^2) controlling the trade-off
-            between precision and recall.  A lower beta_squared places more
-            emphasis on precision.
-
-    Returns:
-        The p-FM score.
-    """
+    """Compute pseudo-F measure (p-FM) from precision and recall."""
     if (precision + recall) == 0:
         return 0.0
     return (1 + beta_squared) * precision * recall / (beta_squared * precision + recall)
 
 def _tensor_to_numpy(t: torch.Tensor) -> np.ndarray:
-    """Detach and transfer a torch Tensor to CPU NumPy array."""
+    """Detach and move to CPU numpy array."""
     return t.detach().cpu().numpy()
 
 def convert_to_numpy(output: torch.Tensor, target: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-    """Convert network outputs and targets to NumPy arrays for metric computations.
-
-    For single-channel outputs (e.g. segmentation masks), the channel
-    dimension is squeezed to produce a (B, H, W) array.
-
-    Args:
-        output: Output tensor from the model (B, C, H, W) or (B, H, W).
-        target: Target tensor (B, 1, H, W) or (B, H, W).
-
-    Returns:
-        A tuple of (output_np, target_np) both shaped (B, H, W).
-    """
+    """Convert model outputs and targets to (B, H, W) numpy arrays."""
     if output.ndim == 4 and output.shape[1] == 1:
         output_np = _tensor_to_numpy(output.squeeze(1))
     else:
         output_np = _tensor_to_numpy(output)
     return output_np, _tensor_to_numpy(target)
+
+# ---------------------------------------------------------------------------
+# Forward passes
+# ---------------------------------------------------------------------------
 
 def _forward_nca(
     model: torch.nn.Module,
@@ -250,54 +227,34 @@ def _forward_nca(
 ) -> Tuple[torch.Tensor, float, torch.Tensor]:
     """Forward pass for an NCA model with iterative state updates.
 
-    Args:
-        model: The NCA model implementing a step-based update.
-        x: Input tensor representing the current state.  Shape (B, C, H, W).
-        y: Target tensor.  Shape (B, 1, H, W).
-        pixel_weight: Weight applied to the pixel-accuracy term in the loss.
-        mode: Either "train" or "eval", used to gate optional visualisation.
-
-    Returns:
-        A tuple of (loss, correct_pixels, activated_output), where
-        ``activated_output`` is passed through a sigmoid.
+    Uses composite_loss with pixel-accuracy weighting when available,
+    otherwise falls back to BCE from the legacy utilities.
     """
     loss = 0.0
     for _ in range(CAMODEL_CONFIG["steps"]):
         x = model(x)
-        loss += composite_loss(x[:, 3], y.squeeze(1), pixel_accuracy_weight=pixel_weight)
-    correct, _ = calculate_pixel_accuracy(x[:, 3], y)
+        logits = x[:, 3]
+        target = y.squeeze(1)
+        if _HAVE_NEW_UTILS:
+            loss += _composite_loss(logits, target, pixel_accuracy_weight=pixel_weight)
+        else:
+            loss += _compute_binary_cross_entropy(logits, target)
+    correct, _ = compute_pixel_accuracy_fn(x[:, 3], y)
     return loss, correct, torch.sigmoid(x[:, 3])
 
 def _forward_generic(
     model: torch.nn.Module,
     x: torch.Tensor,
     y: torch.Tensor,
-    loss_function: torch.nn.Module,
+    loss_function: Optional[torch.nn.Module],
     activation_needed: bool = True,
 ) -> Tuple[torch.Tensor, float, torch.Tensor]:
-    """Forward pass for segmentation models that output raw logits.
-
-    Some segmentation models (e.g. torchvision's DeepLabV3) return a
-    dictionary with the logits under the key ``"out"``.  This helper
-    abstracts over that difference and always returns a tensor of logits.
-
-    Args:
-        model: The segmentation model.
-        x: Input tensor.  Shape (B, C, H, W).
-        y: Target tensor.  Shape (B, 1, H, W).
-        loss_function: Loss function to apply to the logits and targets.
-        activation_needed: Whether to apply a sigmoid activation to the
-            output before returning it.  This should generally be ``True``
-            for segmentation models producing per-pixel logits.
-
-    Returns:
-        A tuple of (loss, correct_pixels, activated_output_or_logits).
-    """
+    """Forward pass for segmentation models that output logits (or dicts)."""
     out = model(x)
-    # Handle models returning a dict (DeepLabV3)
     out = out["out"] if isinstance(out, dict) else out
+    assert loss_function is not None, "loss_function must be provided for non-NCA models."
     loss = loss_function(out, y)
-    correct, _ = calculate_pixel_accuracy(torch.sigmoid(out), y)
+    correct, _ = compute_pixel_accuracy_fn(torch.sigmoid(out), y)
     return loss, correct, torch.sigmoid(out) if activation_needed else out
 
 def forward_pass(
@@ -305,131 +262,87 @@ def forward_pass(
     x: torch.Tensor,
     y: torch.Tensor,
     model_name: str,
-    loss_function: torch.nn.Module | None,
+    loss_function: Optional[torch.nn.Module],
     mode: str = "train",
 ) -> Tuple[torch.Tensor, float, torch.Tensor]:
-    """Compute a single forward pass and return loss, accuracy and output.
-
-    Dispatches to the appropriate helper depending on the model type.
-
-    Args:
-        model: The neural network.
-        x: Input tensor.
-        y: Target tensor.
-        model_name: A string identifying the model type.  Must be one of
-            ``"nca"``, ``"deeplabv3"`` or any other supported model.
-        loss_function: Loss function used by models other than NCA.
-        mode: Either "train" or "eval".
-
-    Returns:
-        A tuple (loss, correct_pixels, activated_output).
-    """
+    """Dispatch to the appropriate forward pass and return (loss, acc, output)."""
     if model_name == "nca":
-        # For NCA we modulate the pixel_accuracy_weight depending on
-        # training/evaluation.  During training we place more weight on
-        # pixel accuracy; during evaluation we reduce it as done in
-        # ``train.py``.
         pixel_weight = 1.0 if mode == "train" else 0.1
         return _forward_nca(model, x, y, pixel_weight, mode)
     if model_name == "deeplabv3":
-        # torchvision models return a dict
         out_dict = model(x)
-        loss = loss_function(out_dict["out"], y)
-        correct, _ = calculate_pixel_accuracy(torch.sigmoid(out_dict["out"]), y)
-        return loss, correct, torch.sigmoid(out_dict["out"])
-    # All other models: raw logits are exposed directly
+        logits = out_dict["out"]
+        assert loss_function is not None, "loss_function must be provided for non-NCA models."
+        loss = loss_function(logits, y)
+        correct, _ = compute_pixel_accuracy_fn(torch.sigmoid(logits), y)
+        return loss, correct, torch.sigmoid(logits)
     return _forward_generic(model, x, y, loss_function)
+
+# ---------------------------------------------------------------------------
+# Training/evaluation loop
+# ---------------------------------------------------------------------------
 
 def _run_epoch(
     *,
     model: torch.nn.Module,
     dataloader: Iterable,
-    optimizer: torch.optim.Optimizer | None,
-    loss_function: torch.nn.Module | None,
+    optimizer: Optional[torch.optim.Optimizer],
+    loss_function: Optional[torch.nn.Module],
     device: torch.device,
     model_name: str,
     mode: str,
     epoch_idx: int,
     run_idx: int,
 ) -> Tuple[float, float, float, float, float, float, float, float, float]:
-    """Generic routine for running one pass over the dataset.
-
-    Whether called for training or evaluation, this function computes all
-    metrics defined in ``METRIC_TAGS``, accumulates them across batches,
-    and returns a tuple with the values in the exact order of
-    ``METRIC_TAGS``.  When training, it also performs backpropagation and
-    optimizer updates.  The ``epoch_idx`` and ``run_idx`` arguments are
-    used to gate optional debug visualisations so that they occur on a
-    predictable schedule instead of never being triggered.
-
-    Args:
-        model: The neural network.
-        dataloader: Iterable yielding batches of (images, masks).
-        optimizer: Optimizer to update the model parameters.  Should be
-            ``None`` when ``mode`` is "eval".
-        loss_function: Loss function used for non-NCA models.  Pass
-            ``None`` for NCA.
-        device: Target device (CPU or CUDA).
-        model_name: Name of the model.
-        mode: Either "train" or "eval".
-        epoch_idx: Index of the current epoch (0-based).
-        run_idx: Index of the current run (0-based).
-
-    Returns:
-        A tuple containing the metrics in the order specified by
-        ``METRIC_TAGS``.
-    """
+    """Run one pass over the dataset and compute metrics."""
     is_train = mode == "train"
-    if is_train:
-        model.train()
-    else:
-        model.eval()
+    model.train() if is_train else model.eval()
+
     totals = {tag: 0.0 for tag in METRIC_TAGS}
     total_samples = 0
     all_preds: List[int] = []
     all_targets: List[int] = []
-    # Choose whether to enable debug plotting on this epoch.  In the original
-    # ``train.py`` evaluate_model would show plots when a global counter
-    # ``PICA`` equalled 2.  Here we reproduce similar behaviour by
-    # enabling plotting on the second evaluation epoch of the first run.
+
+    # Show one visualization on first eval epoch of first run
     enable_plot = (not is_train) and (epoch_idx == 0) and (run_idx == 0)
-    # Disable gradient tracking when evaluating
+
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for x, y in dataloader:
             x, y = x.float().to(device), y.float().to(device)
+
             if is_train:
+                assert optimizer is not None
                 optimizer.zero_grad()
+
             loss, correct, output = forward_pass(
                 model, x, y, model_name, loss_function, mode=mode
             )
+
             output_np, y_np = convert_to_numpy(output, y)
             batch_size = output_np.shape[0]
-            # Aggregate scalar metrics
+
             totals["Loss"] += loss.item()
             totals["Accuracy"] += correct
             totals["PSNR"] += compute_psnr_batch(output_np, y_np) * batch_size
-            # Binarize predictions/targets for classification-style metrics
+
             binary_preds = (output_np > 0.5).astype(np.uint8)
             binary_targets = (y_np > 0.5).astype(np.uint8)
             totals["DRD"] += compute_drd_batch(binary_preds, binary_targets) * batch_size
+
             all_preds.extend(binary_preds.flatten())
             all_targets.extend(binary_targets.flatten())
             total_samples += batch_size
+
             if is_train:
                 loss.backward()
                 optimizer.step()
-            # Optional visualisation: on a fixed schedule plot the first
-            # sample in the batch.  This reproduces the behaviour of the
-            # ``train.py`` script without requiring an always-false random
-            # condition.
+
             if enable_plot:
-                # Only plot once per epoch
                 enable_plot = False
                 inp = x[0]
                 gt = y[0, 0]
                 pred_mask = output[0, 0] if output.ndim == 4 else output[0]
-                # Detach & convert to NumPy
                 if inp.shape[0] == 3:
                     inp_img = inp.cpu().permute(1, 2, 0).numpy()
                 else:
@@ -447,42 +360,44 @@ def _run_epoch(
                     a.axis("off")
                 plt.tight_layout()
                 plt.show()
-    # Compute classification metrics once per epoch
+
     preds_array = np.array(all_preds)
     targets_array = np.array(all_targets)
-    precision = precision_score(targets_array, preds_array)
-    recall = recall_score(targets_array, preds_array)
-    f1 = f1_score(targets_array, preds_array)
+
+    precision = precision_score(targets_array, preds_array, zero_division=0)
+    recall = recall_score(targets_array, preds_array, zero_division=0)
+    f1 = f1_score(targets_array, preds_array, zero_division=0)
     p_fm = compute_p_fm(precision, recall)
-    # Update totals with classification metrics (FM duplicates F1 to keep original contract)
+
     totals.update(
         {
             "Precision": precision,
             "Recall": recall,
             "F1": f1,
-            "FM": f1,
+            "FM": f1,  # to keep original contract
             "p-FM": p_fm,
-            "PSNR": totals["PSNR"] / total_samples,
-            "DRD": totals["DRD"] / total_samples,
+            "PSNR": totals["PSNR"] / max(total_samples, 1),
+            "DRD": totals["DRD"] / max(total_samples, 1),
         }
     )
-    # Normalize accumulated loss and accuracy across batches
-    num_batches = len(dataloader)
+
+    num_batches = max(len(dataloader), 1)
     totals["Loss"] /= num_batches
     totals["Accuracy"] /= num_batches
+
     return tuple(totals[tag] for tag in METRIC_TAGS)
 
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: Iterable,
     optimizer: torch.optim.Optimizer,
-    loss_function: torch.nn.Module | None,
+    loss_function: Optional[torch.nn.Module],
     device: torch.device,
     model_name: str,
     epoch_idx: int,
     run_idx: int,
 ) -> Tuple[float, float, float, float, float, float, float, float, float]:
-    """Public wrapper for a training epoch.  Delegates to ``_run_epoch``."""
+    """Public wrapper for a training epoch."""
     return _run_epoch(
         model=model,
         dataloader=dataloader,
@@ -498,13 +413,13 @@ def train_one_epoch(
 def evaluate_model(
     model: torch.nn.Module,
     dataloader: Iterable,
-    loss_function: torch.nn.Module | None,
+    loss_function: Optional[torch.nn.Module],
     device: torch.device,
     model_name: str,
     epoch_idx: int,
     run_idx: int,
 ) -> Tuple[float, float, float, float, float, float, float, float, float]:
-    """Public wrapper for an evaluation pass.  Delegates to ``_run_epoch``."""
+    """Public wrapper for an evaluation pass."""
     return _run_epoch(
         model=model,
         dataloader=dataloader,
@@ -535,7 +450,6 @@ def _init_segnet() -> torch.nn.Module:
 
 def _init_deeplabv3() -> torch.nn.Module:
     model = deeplabv3_resnet50(**DEEPLABV3_CONFIG)
-    # Replace the first convolution to support arbitrary input channels
     model.backbone.conv1 = torch.nn.Conv2d(**DEEPLABV3_CONFIG_CONV1)
     return model.to(DEVICE)
 
@@ -552,30 +466,14 @@ _MODEL_FACTORY: Dict[str, Any] = {
 }
 
 def initialize_model(model_name: str) -> torch.nn.Module:
-    """Instantiate a model given its name.
-
-    Args:
-        model_name: Key in ``_MODEL_FACTORY``.
-
-    Returns:
-        The initialised model moved to ``DEVICE``.
-
-    Raises:
-        ValueError: If the model name is not recognised.
-    """
+    """Instantiate a model given its name."""
     try:
         return _MODEL_FACTORY[model_name]()
     except KeyError as exc:
         raise ValueError(f"Unknown model: {model_name}") from exc
 
 def _resolve_shape_and_classes(model_name: str) -> Tuple[int, int]:
-    """Determine the number of input channels and classes for a model.
-
-    Returns a tuple ``(n_channels, n_classes)`` appropriate for creating
-    synthetic inputs when calling ``torchsummary.summary``.  For NCA we
-    treat it as a single-class problem even though the CAModel itself
-    maintains multiple state channels.
-    """
+    """Determine the number of input channels and classes for a model."""
     if model_name in {"unet_tiny", "unet_normal"}:
         cfg = UNET_CONFIG
     elif model_name == "nca":
@@ -603,32 +501,15 @@ def _prepare_loaders(
     crop_size: int,
     filter_masks: bool,
 ) -> Tuple[Iterable, Iterable]:
-    """Create train and test dataloaders with optional dataset splitting.
-
-    For certain datasets (e.g. ``dibco`` or ``trees``) the original
-    ``train.py`` script loaded the entire training set and then split it
-    into 50% train and 50% test.  To preserve this behaviour the
-    function checks the ``dataset_name`` entry in ``TRAINING_CONFIG`` and
-    performs the split if necessary; otherwise it creates separate
-    dataloaders using the train/test directories from ``TRAINING_CONFIG``.
-
-    Args:
-        n_channels: Number of channels in the input images.
-        batch_size: Batch size for loading.
-        crop_size: Crop size used by ``get_dataloader``.
-        filter_masks: Whether to filter out empty masks.
-
-    Returns:
-        A tuple (train_loader, test_loader).
-    """
+    """Create train and test dataloaders with optional dataset splitting."""
     cfg = TRAINING_CONFIG
     train_images_dir = cfg["train_images_dir"]
     train_masks_dir = cfg["train_masks_dir"]
     test_images_dir = cfg["test_images_dir"]
     test_masks_dir = cfg["test_masks_dir"]
     dataset_name = cfg.get("dataset_name", "")
-    # Primary train loader
-    train_loader = get_dataloader(
+
+    train_loader = get_dataloader_fn(
         train_images_dir,
         train_masks_dir,
         n_channels,
@@ -636,9 +517,8 @@ def _prepare_loaders(
         crop_size,
         filter_masks,
     )
-    # For certain datasets we split the training set ourselves.  This
-    # behaviour originated in ``train.py`` and is retained here.  We
-    # accumulate all samples from the loader, shuffle and split 50/50.
+
+    # Special 50/50 split for certain datasets
     if dataset_name in {"dibco", "trees"}:
         images_list: List[torch.Tensor] = []
         masks_list: List[torch.Tensor] = []
@@ -659,7 +539,7 @@ def _prepare_loaders(
         train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
         test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
     else:
-        test_loader = get_dataloader(
+        test_loader = get_dataloader_fn(
             test_images_dir,
             test_masks_dir,
             n_channels,
@@ -669,96 +549,77 @@ def _prepare_loaders(
         )
     return train_loader, test_loader
 
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
 def main(
     *,
     model_name: str = "nca",
     run: int = 0,
     steps: int = 1,
-) -> Tuple[Tuple[Any, Any], Dict[str, Dict[str, List[float]]]]:
-    """Top-level training routine for a single run.
-
-    This function orchestrates the complete training and evaluation cycle
-    for one configuration of model, run index and number of NCA steps.
-    It mirrors the logic found in both original scripts: it instantiates
-    the model, prepares the data loaders (including dataset splitting
-    where appropriate), runs through the specified number of epochs
-    collecting detailed metrics, logs results via TensorBoard and
-    ``log_loss``, saves model weights and logs hardware metrics.
-
-    Args:
-        model_name: Name of the model architecture to train.
-        run: Index of the current run (0-based).  Used for naming
-            output directories and files.
-        steps: Number of steps to update the NCA (only relevant when
-            ``model_name == 'nca'``).
-
-    Returns:
-        A tuple ``((best_test, best_train), epoch_curve)`` where
-        ``best_test`` and ``best_train`` are the metric tuples
-        corresponding to the best test loss encountered during training,
-        and ``epoch_curve`` is a dictionary mapping ``"Train"`` and
-        ``"Test"`` to per-epoch metric histories.
-    """
+) -> Tuple[Tuple[Any, Any, int], Dict[str, Dict[str, List[float]]]]:
+    """Top-level training routine for a single run."""
     start_time = time.time()
-    # Adjust global configuration if running an NCA experiment
+
     if model_name == "nca":
         CAMODEL_CONFIG["steps"] = steps
+
     n_channels, _ = _resolve_shape_and_classes(model_name)
     cfg = TRAINING_CONFIG
     model = initialize_model(model_name)
-    # Print model summary for non-Deeplab models to aid debugging
+
+    # Print model summary for non-Deeplab models
     if model_name != "deeplabv3":
         try:
             from torchsummary import summary
             summary(model, (n_channels, 200, 200))
         except Exception:
-            # ``torchsummary`` might not be available; ignore if so
             pass
+
     optimizer = cfg["optimizer"](model.parameters(), lr=cfg["learning_rate"])
     scheduler = cfg["scheduler"](
         optimizer,
         step_size=cfg["scheduler_step_size"],
         gamma=cfg["scheduler_gamma"],
     )
-    # Loss function is only needed for non-NCA models
     loss_function = (
         cfg["loss_function"]
         if model_name in {"unet_tiny", "unet_normal", "segnet", "deeplabv3", "pspnet"}
         else None
     )
-    # Determine whether to filter empty masks
+
     filter_masks = cfg.get("dataset_name", "") == "dibco"
-    # Prepare loaders, possibly splitting the dataset
+
     train_loader, test_loader = _prepare_loaders(
         n_channels=n_channels,
         batch_size=cfg["batch_size"],
         crop_size=200,
         filter_masks=filter_masks,
     )
-    # TensorBoard writer
+
     run_tag = f"{model_name}_steps_{steps}_run_{run + 1}"
     writer = SummaryWriter(Path("runs") / run_tag)
-    # Data structure to store per-epoch metrics for plotting later
+
     epoch_curve: Dict[str, Dict[str, List[float]]] = {
         "Train": {tag: [] for tag in METRIC_TAGS},
         "Test": {tag: [] for tag in METRIC_TAGS},
     }
     best_loss = float("inf")
     best_train = best_test = None
-    best_epoch = None
+    best_epoch = -1
+
     for epoch in range(cfg["epochs"]):
         print(f"Run {run + 1} | Epoch {epoch + 1}/{cfg['epochs']} | steps: {steps}")
-        # Initial evaluation on the test set before any training occurs
+
         if epoch == 0:
             init_metrics = evaluate_model(
                 model, test_loader, loss_function, DEVICE, model_name, epoch, run
             )
             for i, tag in enumerate(METRIC_TAGS):
                 writer.add_scalar(f"Test/{tag}", init_metrics[i], epoch)
-            print(
-                f"Initial Test: Loss={init_metrics[0]:.4f}, Acc={init_metrics[1]:.2f}%"
-            )
-        # Training pass
+            print(f"Initial Test: Loss={init_metrics[0]:.4f}, Acc={init_metrics[1]:.2f}%")
+
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -769,23 +630,23 @@ def main(
             epoch,
             run,
         )
-        # Evaluation pass
+
         test_metrics = evaluate_model(
             model, test_loader, loss_function, DEVICE, model_name, epoch, run
         )
-        # Track best model according to test loss
+
         if test_metrics[0] < best_loss:
             best_loss = test_metrics[0]
             best_train = train_metrics
             best_test = test_metrics
             best_epoch = epoch
-        # Log metrics to TensorBoard and in-memory curves
+
         for i, tag in enumerate(METRIC_TAGS):
             writer.add_scalar(f"Train/{tag}", train_metrics[i], epoch)
             writer.add_scalar(f"Test/{tag}", test_metrics[i], epoch)
             epoch_curve["Train"][tag].append(train_metrics[i])
             epoch_curve["Test"][tag].append(test_metrics[i])
-        # Construct a model_config dict only for NCA models to log
+
         model_config: Dict[str, Any] = {}
         if model_name == "nca":
             model_config = {
@@ -798,25 +659,27 @@ def main(
                 "neighbour": CAMODEL_CONFIG["neighbour"],
                 "steps": CAMODEL_CONFIG["steps"],
             }
-        # Persist results using the provided ``log_loss`` helper.  The
-        # helper expects dictionaries mapping metric names to values.
-        log_loss(
+
+        # Persist metrics using compat wrapper
+        _log_results(
             epoch,
             dict(zip(METRIC_TAGS, train_metrics)),
             dict(zip(METRIC_TAGS, test_metrics)),
             f"{model_name}_steps_{steps}",
             run,
             model_config=model_config,
-            print_results=True,
         )
+
         scheduler.step()
+
     writer.close()
-    # Save model weights.  Use the same filename pattern as in the
-    # original scripts.
+
+    # Save model weights
     os.makedirs("models", exist_ok=True)
     model_path = f"models/mynet_weights_small_run{run}.pt"
     torch.save(model.state_dict(), model_path)
-    # Compute MACs and other hardware statistics
+
+    # HW/model stats
     macs = estimate_model_macs(model, input_shape=(CAMODEL_CONFIG.get("n_channels", n_channels), 200, 200))
     model_stats = {
         "model_name": model_name,
@@ -827,59 +690,46 @@ def main(
         "training_time": f"{(time.time() - start_time):.2f}s",
         "hardware_target": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
     }
-    log_hw_metrics(run_id=run, model_name=model_name, model_stats=model_stats)
-    # Return best metrics and entire curve for further analysis
-    return (best_test, best_train), epoch_curve
+    _log_hw(run_id=run, model_name=model_name, model_stats=model_stats)
+
+    return (best_test, best_train, best_epoch), epoch_curve
+
+# ---------------------------------------------------------------------------
+# Standalone experiments
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    """Run experiments with varying NCA steps and multiple runs.
-
-    The main block here mirrors the standalone invocation logic from
-    ``train_steps.py``.  It iterates over a list of step values and a
-    number of runs per step, aggregates final results, averages
-    epoch-wise curves and prints a summary of the best results.  For
-    simplicity the step variants and number of runs can be adjusted
-    directly in the lists below.
-    """
-    # Define the range of NCA step counts to experiment with.  Feel free
-    # to modify this list to explore different step counts.  For non-NCA
-    # models the ``steps`` argument has no effect.
+    """Run experiments with varying NCA steps and multiple runs."""
     STEPS_VARIANTS: List[int] = [1]
-    # Number of independent runs per step count.  Increasing this can
-    # smooth out random variation in training outcomes.
     N_RUNS = 2
     final_results: Dict[int, Dict[str, List[Any]]] = {
         s: {"final": [], "curves": []} for s in STEPS_VARIANTS
     }
+
     for steps in STEPS_VARIANTS:
         CAMODEL_CONFIG["steps"] = steps
         for run in range(N_RUNS):
             print(f"\nRunning experiment: steps={steps}, run={run + 1}")
-            (best_test, best_train), curve = main(model_name="nca", run=run, steps=steps)
-            final_results[steps]["final"].append((best_train, best_test))
+            (best_test, best_train, best_epoch), curve = main(model_name="nca", run=run, steps=steps)
+            final_results[steps]["final"].append((best_train, best_test, best_epoch))
             final_results[steps]["curves"].append(curve)
-    # Average curves across runs and log to a separate writer
+
     writer_avg = SummaryWriter(Path("runs") / "avg_nca")
     for steps, data in final_results.items():
         curves_list = data["curves"]
         total_epochs = len(curves_list[0]["Test"]["Loss"])
         for epoch in range(total_epochs):
             for tag in METRIC_TAGS:
-                avg_train = float(
-                    np.mean([c["Train"][tag][epoch] for c in curves_list])
-                )
-                avg_test = float(
-                    np.mean([c["Test"][tag][epoch] for c in curves_list])
-                )
+                avg_train = float(np.mean([c["Train"][tag][epoch] for c in curves_list]))
+                avg_test = float(np.mean([c["Test"][tag][epoch] for c in curves_list]))
                 writer_avg.add_scalar(f"Avg/steps_{steps}/Train/{tag}", avg_train, epoch)
                 writer_avg.add_scalar(f"Avg/steps_{steps}/Test/{tag}", avg_test, epoch)
     writer_avg.close()
-    # Display best results per steps value
+
     for steps, data in final_results.items():
         run_results = data["final"]
-        # Index of the run with minimum test loss
-        best_idx = int(np.argmin([res[1][0] for res in run_results]))
-        best_train, best_test = run_results[best_idx]
+        best_idx = int(np.argmin([res[1][0] for res in run_results]))  # min Test Loss
+        best_train, best_test, best_epoch = run_results[best_idx]
         print(f"\n=== BEST RESULTS for steps={steps} (run {best_idx + 1}) ===")
         print(
             (
@@ -898,5 +748,5 @@ if __name__ == "__main__":
         print(
             (
                 "Train Loss at best epoch: {0:.4f}, Acc: {1:.2f}% (epoch {2})"
-            ).format(best_train[0], best_train[1], best_epoch if 'best_epoch' in locals() else '?')
+            ).format(best_train[0], best_train[1], best_epoch)
         )
