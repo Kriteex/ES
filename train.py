@@ -145,6 +145,54 @@ _DRD_WEIGHTS = np.array(
     [[1.0 / (abs(i - 2) + abs(j - 2) + 1) for j in range(5)] for i in range(5)]
 )
 
+WNM = _DRD_WEIGHTS
+
+def count_nubn(gt: np.ndarray, block_size: int = 8) -> int:
+    """
+    Spočítá NUBN – počet neuniformních (tj. obsahujících alespoň jeden pixel 0 i 1) bloků block_size×block_size v GT.
+    Pokud by GT neobsahovala žádný takový blok, vrací 1, aby se předešlo dělení nulou.
+    """
+    h, w = gt.shape
+    nubn = 0
+    for by in range(0, h, block_size):
+        for bx in range(0, w, block_size):
+            block = gt[by:by + block_size, bx:bx + block_size]
+            if block.size == 0:
+                continue
+            # blok je neuniformní, pokud obsahuje alespoň jednu 0 i jednu 1
+            if np.any(block == 0) and np.any(block == 1):
+                nubn += 1
+    return nubn if nubn > 0 else 1
+
+def compute_drd_standard(pred: np.ndarray, gt: np.ndarray, weights: np.ndarray = WNM) -> float:
+    """
+    Implementace DRD podle definice v DIBCO.
+    pred a gt musí být binární masky (0/1).
+    1. Pro každý chybný pixel zjistíme jeho DRD_k: součet vah v 5×5 okně podle GT.
+    2. Součet všech DRD_k dělíme počtem neuniformních bloků (NUBN).
+    """
+    pred = np.squeeze(pred).astype(np.uint8)
+    gt   = np.squeeze(gt).astype(np.uint8)
+    diff = (pred != gt).astype(np.uint8)
+
+    # padneme GT, aby bylo možné vyříznout 5×5 okno kolem okrajů
+    pad_gt = np.pad(gt, 2, mode="edge")
+    error_coords = np.argwhere(diff == 1)
+
+    drd_total = 0.0
+    for y, x in error_coords:
+        # 5×5 okno v GT
+        window_gt = pad_gt[y:y + 5, x:x + 5]
+        # GT v centru chyby (0 nebo 1)
+        gt_center = gt[y, x]
+        # DRD_k: sum_j W(j) * |window_gt(j) - gt_center|
+        drd_k = np.sum(weights * np.abs(window_gt - gt_center))
+        drd_total += drd_k
+
+    nubn = count_nubn(gt, block_size=8)
+    return drd_total / nubn
+
+
 def estimate_conv2d_macs(conv: torch.nn.Module, input_shape: Tuple[int, int, int]) -> int:
     """Estimate multiply–accumulate (MAC) operations for a single Conv2d layer."""
     if not isinstance(conv, torch.nn.Conv2d):
@@ -174,12 +222,26 @@ def estimate_model_macs(model: torch.nn.Module, input_shape: Tuple[int, int, int
             current_shape = (layer.out_channels, H_out, W_out)
     return total_macs
 
-def compute_psnr_batch(pred_batch: np.ndarray, tgt_batch: np.ndarray, eps: float = 1e-10) -> float:
-    """Compute average PSNR across a batch of predictions/targets in [0, 1]."""
+def compute_psnr_batch(
+    pred_batch: np.ndarray,
+    tgt_batch: np.ndarray,
+    *,
+    threshold: float = 0.5,
+    eps: float = 1e-10,
+) -> float:
+    """
+    Spočítá PSNR mezi binárními maskami.
+    
+    - pred_batch: (B, H, W) – výstupy modelu v rozmezí [0, 1]
+    - tgt_batch:  (B, H, W) – binární ground‑truth
+    - threshold:  Prahovací hodnota; pixely > threshold jsou považovány za 1
+    """
     psnr_values: List[float] = []
     for pred, tgt in zip(pred_batch, tgt_batch):
-        mse = max(np.mean((pred - tgt) ** 2), eps)
-        psnr_values.append(10 * math.log10(1.0 / mse))
+        pred_bin = (pred > threshold).astype(np.float32)
+        tgt_bin = (tgt > threshold).astype(np.float32)
+        mse = max(np.mean((pred_bin - tgt_bin) ** 2), eps)
+        psnr_values.append(10.0 * math.log10(1.0 / mse))
     return float(np.mean(psnr_values))
 
 def compute_drd(pred: np.ndarray, gt: np.ndarray) -> float:
@@ -193,8 +255,11 @@ def compute_drd(pred: np.ndarray, gt: np.ndarray) -> float:
     return 0.0 if num_error_pixels == 0 else total_drd / num_error_pixels
 
 def compute_drd_batch(pred_batch: np.ndarray, tgt_batch: np.ndarray) -> float:
-    """Average DRD over batch of binary predictions and ground truths."""
-    return float(np.mean([compute_drd(p, t) for p, t in zip(pred_batch, tgt_batch)]))
+    return float(np.mean([
+        compute_drd_standard(p, t)
+        for p, t in zip(pred_batch, tgt_batch)
+    ]))
+
 
 def compute_p_fm(precision: float, recall: float, beta_squared: float = 0.3) -> float:
     """Compute pseudo-F measure (p-FM) from precision and recall."""
