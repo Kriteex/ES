@@ -57,19 +57,8 @@ from utils import (
     save_batch_visualization as _save_batch_visualization,  # may remain unused
 )
 
-# Try to import the newer (long script B) names; fall back if unavailable
-try:
-    from utils import (
-        calculate_pixel_accuracy as _calculate_pixel_accuracy,
-        composite_loss as _composite_loss,
-        get_dataloader as _get_dataloader,
-        log_loss as _log_loss,
-        log_hw_metrics as _log_hw_metrics,
-        plot_batch_x_channels as _plot_batch_x_channels,  # may remain unused
-    )
-    _HAVE_NEW_UTILS = True
-except Exception:
-    _HAVE_NEW_UTILS = False
+
+_HAVE_NEW_UTILS = False
 
 # Unify surface API for the rest of the script
 compute_pixel_accuracy_fn = _calculate_pixel_accuracy if _HAVE_NEW_UTILS else _compute_pixel_accuracy
@@ -305,7 +294,7 @@ def _forward_nca(
         else:
             loss += _compute_binary_cross_entropy(logits, target)
     correct, _ = compute_pixel_accuracy_fn(x[:, 3], y)
-    return loss, correct, torch.sigmoid(x[:, 3])
+    return loss, correct, x[:, 3]
 
 def _forward_generic(
     model: torch.nn.Module,

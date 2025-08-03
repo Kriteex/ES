@@ -141,6 +141,25 @@ def compute_pixel_accuracy(
         A tuple of (accuracy_percent, error_percent).
     """
     binary_pred = (predicted > threshold).float()
+
+    """
+    # Squeeze for plotting (assuming B, H, W and B, 1, H, W)
+    pred_plot = binary_pred[0].cpu().detach().numpy()
+    target_plot = target[0, 0].cpu().detach().numpy()
+
+    # Plot the prediction and the target
+    fig, axs = plt.subplots(1, 2, figsize=(8, 4))
+    axs[0].imshow(pred_plot, cmap='gray', vmin=0, vmax=1)
+    axs[0].set_title('Predicted (binary)')
+    axs[0].axis('off')
+
+    axs[1].imshow(target_plot, cmap='gray', vmin=0, vmax=1)
+    axs[1].set_title('Target')
+    axs[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    """
     correct = (binary_pred == target.squeeze(1)).float()
     accuracy = correct.mean().item() * 100.0
     return accuracy, 100.0 - accuracy
