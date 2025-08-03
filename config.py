@@ -44,7 +44,7 @@ PSPNET_CONFIG: dict = {"in_channels": 3, "classes": 1, "encoder_name": "resnet50
 
 # Each CA configuration is a dictionary of hyperparameters.  Use the one that
 # best suits your experiment; see README for guidance.
-CAMODEL_CONFIG = { #_01_MINIMAL = {
+CAMODEL_CONFIG_01_MINIMAL = {
     "n_channels": 4,
     "hidden_channels": 1,
     "fire_rate": 0.5,
@@ -80,7 +80,7 @@ CAMODEL_CONFIG_03_WIDE = {
     "steps": 2,
 }
 
-CAMODEL_CONFIG_04_RESIDUAL_LIGHT = {
+CAMODEL_CONFIG = { #_04_RESIDUAL_LIGHT = {
     "n_channels": 4,
     "hidden_channels": 32,
     "fire_rate": 0.5,

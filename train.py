@@ -405,6 +405,45 @@ def _run_epoch(
 
             if enable_plot:
                 enable_plot = False
+                inp = x[0]  # (C, H, W)
+                gt = y[0, 0].cpu().numpy()
+                raw_pred = output[0, 0].detach().cpu().numpy() if output.ndim == 4 else output[0].detach().cpu().numpy()
+                bin_pred = (raw_pred > 0.5).astype(np.float32)
+                diff = np.abs(bin_pred - gt)
+
+                if inp.shape[0] == 3:
+                    inp_img = inp.cpu().permute(1, 2, 0).numpy()
+                    cmap_input = None
+                else:
+                    inp_img = inp[0].cpu().numpy()
+                    cmap_input = "gray"
+
+                fig, axs = plt.subplots(1, 5, figsize=(20, 4))
+
+                axs[0].imshow(inp_img, cmap=cmap_input)
+                axs[0].set_title("Input")
+
+                axs[1].imshow(gt, cmap="gray")
+                axs[1].set_title("Ground Truth")
+
+                axs[2].imshow(raw_pred, cmap="gray")
+                axs[2].set_title("Raw Prediction")
+
+                axs[3].imshow(bin_pred, cmap="gray")
+                axs[3].set_title("Binary Prediction (>0.5)")
+
+                axs[4].imshow(diff, cmap="hot")
+                axs[4].set_title("Difference (|Pred - GT|)")
+
+                for ax in axs:
+                    ax.axis("off")
+
+                plt.tight_layout()
+                plt.show()
+
+
+            if enable_plot:
+                enable_plot = False
                 inp = x[0]
                 gt = y[0, 0]
                 pred_mask = output[0, 0] if output.ndim == 4 else output[0]
@@ -770,7 +809,7 @@ if __name__ == "__main__":
     final_results: Dict[int, Dict[str, List[Any]]] = {
         s: {"final": [], "curves": []} for s in STEPS_VARIANTS
     }
-
+    print("UTILS :" + str(_HAVE_NEW_UTILS))
     for steps in STEPS_VARIANTS:
         CAMODEL_CONFIG["steps"] = steps
         for run in range(N_RUNS):
